@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+# **************************************************************************** #
+#  mkgen - generateur de Makefile (norme 42)                                   #
+#                                                                              #
+#  mkgen                     scanne tous les .c/.h du dossier courant          #
+#  mkgen src inc main.c      scanne seulement ces dossiers / fichiers          #
+#  mkgen -o obj              .o dans le dossier obj/ (cree s'il n'existe pas)  #
+#  mkgen -n nom              nom de l'executable (ou libxxx.a pour une lib)    #
+#  mkgen -b nom              nom de l'executable bonus (defaut : meme que NAME)#
+# **************************************************************************** #
+
+import os
+import re
+import sys
+import tempfile
+
+USAGE = """\
+usage : mkgen [-n nom] [-b nom_bonus] [chemin ...] [-o dossier_obj]
+
+  sans chemin     scanne recursivement tous les .c et .h du dossier courant
+  chemin ...      scanne seulement ces dossiers et/ou fichiers .c / .h
+  -o dossier      dossier de sortie des .o (cree s'il n'existe pas)
+  -n nom          nom du programme (defaut : nom du dossier courant)
+                  un nom en .a (ex : libft.a) genere une bibliotheque (ar rcs)
+  -b nom          nom du binaire bonus (defaut : le meme que NAME)
+  -h, --help      affiche cette aide
+
+Le Makefile genere est ecrit dans le dossier courant (l'ancien est remplace).
+Regles : all, $(NAME), clean, fclean, re, ac, norme, valgrind (+ bonus si des
+fichiers *_bonus.c / *_bonus.h existent).
+"""
+
+VALID_PATH = re.compile(r'^[A-Za-z0-9._+\-/]+$')
+VALID_NAME = re.compile(r'^[A-Za-z0-9._+\-]+$')
+INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+MAIN_RE = re.compile(r'\b(?:int|void)\s+main\s*\(')
+MK_NAME_RE = re.compile(r'^[ \t]*NAME[ \t]*[:?]?=[ \t]*([^\s#]+)', re.M)
+
+
+def die(msg):
+    print("mkgen: erreur : " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print("mkgen: attention : " + msg, file=sys.stderr)
+
+
+# ------------------------------------------------------------------ options --
+
+def parse_args(argv):
+    opts = {"-o": None, "-n": None, "-b": None}
+    paths = []
+    only_paths = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if not only_paths and a == "--":
+            only_paths = True
+        elif not only_paths and a in ("-h", "--help"):
+            print(USAGE, end="")
+            sys.exit(0)
+        elif not only_paths and a in opts:
+            if i + 1 >= len(argv):
+                die("il manque une valeur apres '%s'" % a)
+            val = argv[i + 1]
+            if val == "" or val.startswith("-"):
+                die("'%s' attend une valeur, pas '%s'" % (a, val))
+            if opts[a] is not None:
+                die("option '%s' donnee plusieurs fois" % a)
+            opts[a] = val
+            i += 1
+        elif not only_paths and a.startswith("-"):
+            die("option inconnue '%s' (mkgen -h pour l'aide)" % a)
+        elif a == "":
+            die("chemin vide en argument")
+        else:
+            paths.append(a)
+        i += 1
+    return paths, opts["-o"], opts["-n"], opts["-b"]
+
+
+# ------------------------------------------------------------------- chemins --
+
+def norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+def rel_to_root(root, p):
+    """Chemin relatif a la racine en style posix, ou None si hors racine."""
+    rel = os.path.relpath(os.path.abspath(p), root)
+    if rel == os.curdir:
+        return ""
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+def is_inside(child, parent):
+    """child est-il parent ou dedans ?"""
+    child, parent = norm(child), norm(parent)
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:
+        return False
+
+
+def has_makefile(d):
+    return any(os.path.isfile(os.path.join(d, m))
+               for m in ("Makefile", "makefile", "GNUmakefile"))
+
+
+# --------------------------------------------------------------------- scan --
+
+def scan_dir(top, excludes, srcs, hdrs, libdirs):
+    def onerror(e):
+        warn("impossible de lire '%s' (%s), ignore" % (e.filename, e.strerror))
+
+    for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
+        keep = []
+        for d in sorted(dirnames):
+            full = os.path.join(dirpath, d)
+            if d.startswith("."):
+                continue
+            if norm(full) in excludes:
+                continue
+            if os.path.islink(full):
+                warn("lien symbolique '%s' ignore" % full)
+                continue
+            if has_makefile(full):
+                libdirs.add(norm(full))
+                continue
+            keep.append(d)
+        dirnames[:] = keep
+        for f in filenames:
+            if f.startswith("."):
+                continue
+            full = os.path.join(dirpath, f)
+            if f.endswith(".c"):
+                srcs.add(norm(full))
+            elif f.endswith(".h"):
+                hdrs.add(norm(full))
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fd:
+            return fd.read()
+    except OSError as e:
+        die("impossible de lire '%s' (%s)" % (path, e.strerror))
+
+
+def strip_comments(code):
+    code = re.sub(r'/\*.*?\*/', ' ', code, flags=re.S)
+    return re.sub(r'//[^\n]*', ' ', code)
+
+
+def has_main(path):
+    return bool(MAIN_RE.search(strip_comments(read_text(path))))
+
+
+def stem(relpath):
+    """'src/utils_bonus.c' -> 'utils'"""
+    base = os.path.basename(relpath)[:-2]
+    if base.endswith("_bonus"):
+        base = base[:-len("_bonus")]
+    return base
+
+
+def is_bonus(relpath):
+    return os.path.basename(relpath)[:-2].endswith("_bonus")
+
+
+def lib_from_makefile(root, d):
+    """Retourne le chemin relatif du .a produit par d/Makefile, ou None."""
+    for m in ("Makefile", "makefile", "GNUmakefile"):
+        p = os.path.join(d, m)
+        if os.path.isfile(p):
+            match = MK_NAME_RE.search(read_text(p))
+            if not match:
+                return None, "pas de variable NAME trouvee"
+            name = match.group(1)
+            if "$" in name:
+                return None, "NAME = %s non resolvable" % name
+            if not name.endswith(".a"):
+                return None, "NAME = %s n'est pas une bibliotheque .a" % name
+            return rel_to_root(root, os.path.join(d, name)), None
+    return None, "pas de Makefile"
+
+
+def project_header_dirs(root, excludes):
+    """Tous les dossiers du projet qui contiennent des .h, avec la lib
+    (dossier ayant son propre Makefile) a laquelle ils appartiennent."""
+    out = []
+    lib_stack = []
+    for dp, dn, fn in os.walk(root, onerror=lambda e: None):
+        dn[:] = sorted(d for d in dn if not d.startswith(".")
+                       and norm(os.path.join(dp, d)) not in excludes
+                       and not os.path.islink(os.path.join(dp, d)))
+        owner = None
+        if norm(dp) != norm(root):
+            for cand in lib_stack:
+                if is_inside(dp, cand):
+                    owner = cand
+                    break
+            if owner is None and has_makefile(dp):
+                owner = norm(dp)
+                lib_stack.append(owner)
+        if any(f.endswith(".h") for f in fn):
+            out.append((dp, owner))
+    return out
+
+
+def find_include_dirs(root, files, scanned_dirs, project_dirs):
+    """-I minimaux : seulement les dossiers necessaires pour trouver les
+    #include "..." qui ne sont pas a cote du fichier qui les inclut.
+    Retourne (dossiers, libs utilisees, headers hors scan utilises)."""
+    needed, used_libs, outside = [], set(), set()
+    missing = set()
+    owners = {norm(d): lib for d, lib in project_dirs}
+    candidates = [(d, owners.get(norm(d)), True) for d in scanned_dirs]
+    candidates += [(d, lib, False) for d, lib in project_dirs
+                   if norm(d) not in {norm(x) for x in scanned_dirs}]
+    for f in sorted(files):
+        for inc in INCLUDE_RE.findall(strip_comments(read_text(f))):
+            if os.path.isfile(os.path.join(os.path.dirname(f), inc)):
+                continue
+            found = None
+            for d, lib, scanned in candidates:
+                if os.path.isfile(os.path.join(d, inc)):
+                    found = d
+                    if lib:
+                        used_libs.add(lib)
+                    elif not scanned:
+                        outside.add(rel_to_root(root, os.path.join(d, inc)))
+                    break
+            if found is None:
+                missing.add((rel_to_root(root, f), inc))
+            elif found not in needed:
+                needed.append(found)
+    for f, inc in sorted(missing):
+        warn("'%s' inclut \"%s\" qui est introuvable dans le projet"
+             % (f, inc))
+    return needed, used_libs, outside
+
+
+# --------------------------------------------------------------- generation --
+
+def var_list(name, items, width=16):
+    head = name + "\t" * max(1, (width - len(name) + 3) // 4)
+    if not items:
+        return head + "=\n"
+    pad = "\t" * ((len(head.expandtabs(4)) + 1) // 4) + "  "
+    lines = [head + "= " + items[0]]
+    for it in items[1:]:
+        lines[-1] += " \\"
+        lines.append(pad + it)
+    return "\n".join(lines) + "\n"
+
+
+def var(name, value):
+    return var_list(name, [value] if value else [])
+
+
+def generate(cfg):
+    is_lib = cfg["name"].endswith(".a")
+    obj_dir = cfg["obj_dir"]
+    libs = cfg["libs"]
+    has_bonus = bool(cfg["srcs_bonus"])
+    sep_bonus = has_bonus and cfg["name_bonus"] != cfg["name"]
+    mark = "$(OBJ_DIR)/.bonus" if obj_dir else ".bonus"
+    hdr_deps = "$(HEADERS)" + (" $(HEADERS_BONUS)" if has_bonus else "")
+    inc = " $(INCLUDES)" if cfg["includes"] else ""
+
+    o = []
+    o.append(var("NAME", cfg["name"]))
+    if sep_bonus:
+        o.append(var("NAME_BONUS", cfg["name_bonus"]))
+    o.append("\n")
+    o.append(var("CC", "cc"))
+    o.append(var("CFLAGS", "-Wall -Wextra -Werror -g3"))
+    if cfg["includes"]:
+        o.append(var("INCLUDES", " ".join("-I " + d for d in cfg["includes"])))
+    if not is_lib:
+        o.append(var("LDLIBS", ""))
+    if obj_dir:
+        o.append(var("OBJ_DIR", obj_dir))
+    o.append("\n")
+    o.append(var_list("SRCS", cfg["srcs"]))
+    o.append("\n")
+    if has_bonus:
+        o.append(var_list("SRCS_BONUS", cfg["srcs_bonus"]))
+        o.append("\n")
+    o.append(var_list("HEADERS", cfg["hdrs"]))
+    o.append("\n")
+    if has_bonus:
+        o.append(var_list("HEADERS_BONUS", cfg["hdrs_bonus"]))
+        o.append("\n")
+    if libs:
+        o.append(var_list("LIBS", [l for _, l in libs]))
+        o.append("\n")
+    if obj_dir:
+        o.append(var("OBJS", "$(SRCS:%.c=$(OBJ_DIR)/%.o)"))
+        if has_bonus:
+            o.append(var("OBJS_BONUS", "$(SRCS_BONUS:%.c=$(OBJ_DIR)/%.o)"))
+    else:
+        o.append(var("OBJS", "$(SRCS:.c=.o)"))
+        if has_bonus:
+            o.append(var("OBJS_BONUS", "$(SRCS_BONUS:.c=.o)"))
+    if has_bonus and not sep_bonus:
+        o.append(var("BONUS_MARK", mark))
+    if not is_lib:
+        o.append(var("ARGS", ""))
+    o.append("\n")
+
+    libs_dep = " $(LIBS)" if libs else ""
+    libs_link = " $(LIBS)" if libs else ""
+
+    # all
+    o.append("all:%s $(NAME)\n\n" % (" libs" if libs else ""))
+
+    # libs
+    if libs:
+        o.append("libs:\n")
+        for d, _ in libs:
+            o.append("\t@$(MAKE) --no-print-directory -C %s\n" % d)
+        o.append("\n")
+        for d, l in libs:
+            o.append("%s:\n\t@$(MAKE) --no-print-directory -C %s\n\n" % (l, d))
+
+    # $(NAME)
+    o.append("$(NAME): $(OBJS)%s\n" % libs_dep)
+    if is_lib:
+        o.append("\tar rcs $(NAME) $(OBJS)\n")
+    else:
+        o.append("\t$(CC) $(CFLAGS) $(OBJS)%s $(LDLIBS) -o $(NAME)\n" % libs_link)
+    if has_bonus and not sep_bonus:
+        o.append("\t@rm -f $(BONUS_MARK)\n")
+    o.append("\n")
+
+    # bonus
+    if has_bonus:
+        target = "$(NAME_BONUS)" if sep_bonus else "$(BONUS_MARK)"
+        out = "$(NAME_BONUS)" if sep_bonus else "$(NAME)"
+        o.append("bonus:%s %s\n\n" % (" libs" if libs else "", target))
+        o.append("%s: $(OBJS_BONUS)%s\n" % (target, libs_dep))
+        if is_lib:
+            o.append("\tar rcs %s $(OBJS_BONUS)\n" % out)
+        else:
+            o.append("\t$(CC) $(CFLAGS) $(OBJS_BONUS)%s $(LDLIBS) -o %s\n"
+                     % (libs_link, out))
+        if not sep_bonus:
+            o.append("\t@touch $(BONUS_MARK)\n")
+        o.append("\n")
+
+    # objets (une seule regle : chaque .o depend de son .c, des .h et du Makefile)
+    if obj_dir:
+        o.append("$(OBJ_DIR)/%%.o: %%.c %s Makefile\n" % hdr_deps)
+        o.append("\t@mkdir -p $(dir $@)\n")
+    else:
+        o.append("%%.o: %%.c %s Makefile\n" % hdr_deps)
+    o.append("\t$(CC) $(CFLAGS)%s -c $< -o $@\n\n" % inc)
+
+    # clean / fclean / re / ac
+    o.append("clean:\n")
+    for d, _ in libs:
+        o.append("\t@$(MAKE) --no-print-directory -C %s clean\n" % d)
+    if obj_dir:
+        o.append("\trm -rf $(OBJ_DIR)\n\n")
+    else:
+        extra = " $(OBJS_BONUS) $(BONUS_MARK)" if has_bonus and not sep_bonus \
+            else (" $(OBJS_BONUS)" if has_bonus else "")
+        o.append("\trm -f $(OBJS)%s\n\n" % extra)
+
+    o.append("fclean: clean\n")
+    for d, _ in libs:
+        o.append("\t@$(MAKE) --no-print-directory -C %s fclean\n" % d)
+    o.append("\trm -f $(NAME)%s\n\n" % (" $(NAME_BONUS)" if sep_bonus else ""))
+
+    o.append("re:\n\t@$(MAKE) --no-print-directory fclean\n"
+             "\t@$(MAKE) --no-print-directory all\n\n")
+    o.append("ac:\n\t@$(MAKE) --no-print-directory all\n"
+             "\t@$(MAKE) --no-print-directory clean\n\n")
+
+    # norme / valgrind
+    norm_files = "$(SRCS) $(HEADERS)"
+    if has_bonus:
+        norm_files += " $(SRCS_BONUS) $(HEADERS_BONUS)"
+    o.append("norme:\n\tnorminette -R CheckForbiddenSourceHeader %s\n\n"
+             % norm_files)
+    phony = ["all", "clean", "fclean", "re", "ac", "norme"]
+    if not is_lib:
+        o.append("valgrind: all\n\tvalgrind --leak-check=full "
+                 "--show-leak-kinds=all --track-origins=yes --track-fds=yes "
+                 "./$(NAME) $(ARGS)\n\n")
+        phony.append("valgrind")
+    if has_bonus:
+        phony.append("bonus")
+    if libs:
+        phony.append("libs")
+    o.append(".PHONY: %s\n" % " ".join(phony))
+    return "".join(o)
+
+
+# --------------------------------------------------------------------- main --
+
+def main():
+    paths, obj_arg, name_arg, bname_arg = parse_args(sys.argv[1:])
+    root = os.path.abspath(os.getcwd())
+
+    # --- dossier des .o --------------------------------------------------
+    obj_dir = None
+    obj_abs = None
+    if obj_arg is not None:
+        obj_abs = os.path.abspath(obj_arg)
+        obj_dir = rel_to_root(root, obj_arg)
+        if obj_dir is None:
+            die("le dossier des .o '%s' doit etre dans le dossier courant"
+                % obj_arg)
+        if obj_dir == "":
+            die("le dossier des .o ne peut pas etre le dossier courant")
+        if not VALID_PATH.match(obj_dir):
+            die("nom de dossier des .o invalide '%s' "
+                "(lettres, chiffres, . _ - + / seulement)" % obj_dir)
+        if os.path.lexists(obj_abs) and not os.path.isdir(obj_abs):
+            die("'%s' existe deja et n'est pas un dossier" % obj_dir)
+        if os.path.islink(obj_abs):
+            die("le dossier des .o '%s' est un lien symbolique "
+                "(clean ferait rm -rf dessus)" % obj_dir)
+        if os.path.isdir(obj_abs):
+            if not is_inside(os.path.realpath(obj_abs), os.path.realpath(root)):
+                die("'%s' pointe hors du dossier courant" % obj_dir)
+            for dp, _, fn in os.walk(obj_abs):
+                bad = [f for f in fn if f.endswith((".c", ".h"))]
+                if bad:
+                    die("le dossier des .o '%s' contient des sources (%s) : "
+                        "'make clean' le supprimerait (rm -rf)"
+                        % (obj_dir, rel_to_root(root, os.path.join(dp, bad[0]))))
+            if has_makefile(obj_abs):
+                die("le dossier des .o '%s' contient un Makefile" % obj_dir)
+
+    # --- scan -------------------------------------------------------------
+    excludes = {norm(obj_abs)} if obj_abs else set()
+    srcs, hdrs, libdirs = set(), set(), set()
+    if not paths:
+        scan_dir(root, excludes, srcs, hdrs, libdirs)
+    else:
+        for p in paths:
+            if not os.path.lexists(p):
+                die("'%s' n'existe pas" % p)
+            if rel_to_root(root, p) is None:
+                die("'%s' est hors du dossier courant (le Makefile est genere "
+                    "ici, les sources doivent etre dedans)" % p)
+            if obj_abs and is_inside(p, obj_abs):
+                die("'%s' est dans le dossier des .o" % p)
+            if os.path.isdir(p):
+                scan_dir(p, excludes, srcs, hdrs, libdirs)
+            elif os.path.isfile(p):
+                if p.endswith(".c"):
+                    srcs.add(norm(p))
+                elif p.endswith(".h"):
+                    hdrs.add(norm(p))
+                else:
+                    die("'%s' n'est ni un .c, ni un .h, ni un dossier" % p)
+            else:
+                die("'%s' n'est ni un fichier ni un dossier" % p)
+
+    # chemins relatifs + validation des noms (make ne gere pas les espaces...)
+    def to_rel_list(s):
+        out = []
+        for f in s:
+            r = rel_to_root(root, f)
+            if r is None:
+                die("'%s' est hors du dossier courant" % f)
+            out.append(r)
+        bad = sorted(r for r in out if not VALID_PATH.match(r))
+        if bad:
+            die("noms de fichiers incompatibles avec make (espaces ou "
+                "caracteres speciaux) :\n  " + "\n  ".join(bad))
+        return sorted(out)
+
+    srcs_rel = to_rel_list(srcs)
+    hdrs_rel = to_rel_list(hdrs)
+    if not srcs_rel:
+        die("aucun fichier .c trouve" + (" dans %s" % " ".join(paths)
+                                         if paths else ""))
+
+    # --- separation obligatoire / bonus -----------------------------------
+    mand_c = [s for s in srcs_rel if not is_bonus(s)]
+    bon_c = [s for s in srcs_rel if is_bonus(s)]
+    mand_h = [h for h in hdrs_rel if not os.path.basename(h)
+              .endswith("_bonus.h")]
+    bon_h = [h for h in hdrs_rel if os.path.basename(h).endswith("_bonus.h")]
+
+    if not mand_c and bon_c:
+        warn("seulement des fichiers _bonus trouves : ils sont utilises comme "
+             "sources principales (pas de regle bonus)")
+        mand_c, bon_c = bon_c, []
+        mand_h, bon_h = mand_h + bon_h, []
+
+    srcs_bonus = []
+    if bon_c:
+        bonus_stems = {stem(b) for b in bon_c}
+        bonus_main = any(has_main(os.path.join(root, b)) for b in bon_c)
+        for m in mand_c:
+            if stem(m) in bonus_stems:
+                continue  # remplace par sa version _bonus
+            if bonus_main and has_main(os.path.join(root, m)):
+                continue  # le bonus a deja son main
+            srcs_bonus.append(m)
+        srcs_bonus = sorted(set(srcs_bonus + bon_c))
+    elif bon_h:
+        warn("headers _bonus trouves sans .c _bonus : ils sont traites comme "
+             "headers normaux")
+        mand_h, bon_h = sorted(mand_h + bon_h), []
+
+    # --- nom ----------------------------------------------------------------
+    if name_arg is None:
+        name = re.sub(r'[^A-Za-z0-9._+\-]', '_', os.path.basename(root))
+        name = name.lstrip("-.") or "a.out"
+    else:
+        name = name_arg
+    if bname_arg is not None and not bon_c:
+        warn("-b donne mais aucun fichier _bonus trouve, ignore")
+    name_bonus = bname_arg if bname_arg is not None else name
+    is_lib = name.endswith(".a")
+    for n, opt in ((name, "-n"), (name_bonus, "-b")):
+        if not VALID_NAME.match(n) or n in (".", ".."):
+            die("nom invalide '%s' (%s) : lettres, chiffres, . _ - + "
+                "seulement, pas de /" % (n, opt))
+        if n.endswith((".c", ".h", ".o")) or n in ("Makefile", "makefile"):
+            die("nom '%s' (%s) interdit : il ecraserait un fichier du projet"
+                % (n, opt))
+        if os.path.isdir(os.path.join(root, n)):
+            die("un dossier s'appelle deja '%s', choisis un autre nom avec %s"
+                % (n, opt))
+        if obj_dir and n == obj_dir:
+            die("le nom '%s' est le meme que le dossier des .o" % n)
+    if bon_c and is_lib != name_bonus.endswith(".a"):
+        die("NAME et le nom bonus doivent etre tous les deux des .a ou aucun")
+
+    # --- verifications de main --------------------------------------------
+    if not is_lib:
+        mains = [m for m in mand_c if has_main(os.path.join(root, m))]
+        if not mains:
+            warn("aucun main() trouve dans les sources obligatoires "
+                 "(pour une bibliotheque, utilise -n libxxx.a)")
+        elif len(mains) > 1:
+            warn("plusieurs main() trouves : %s (l'edition de liens va "
+                 "echouer)" % ", ".join(mains))
+        if srcs_bonus:
+            bmains = [m for m in srcs_bonus if has_main(os.path.join(root, m))]
+            if len(bmains) > 1:
+                warn("plusieurs main() dans les sources bonus : %s"
+                     % ", ".join(bmains))
+
+    # --- -I necessaires ---------------------------------------------------
+    hdr_dirs = []
+    for h in mand_h + bon_h:
+        d = os.path.dirname(os.path.join(root, h))
+        if d not in hdr_dirs:
+            hdr_dirs.append(d)
+    all_files = [os.path.join(root, f) for f in mand_c + srcs_bonus
+                 + mand_h + bon_h]
+    inc_abs, used_libs, outside = find_include_dirs(
+        root, all_files, hdr_dirs, project_header_dirs(root, excludes))
+    includes = [rel_to_root(root, d) or "." for d in inc_abs]
+    for d in includes:
+        if not VALID_PATH.match(d):
+            die("dossier d'include au nom invalide '%s'" % d)
+    for h in sorted(outside):
+        warn("'%s' est inclus mais n'est pas dans les chemins donnes : -I "
+             "ajoute, mais il n'est pas dans HEADERS (dependances)" % h)
+
+    # --- bibliotheques en sous-dossier (libft, ...) -----------------------
+    libs = []
+    for d in sorted(libdirs | used_libs):
+        rel_d = rel_to_root(root, d)
+        if any(is_inside(os.path.join(root, s), d) for s in srcs_rel):
+            continue  # ses sources sont deja compilees directement
+        lib, why = lib_from_makefile(root, d)
+        if lib is None or not VALID_PATH.match(rel_d) \
+                or not VALID_PATH.match(lib):
+            warn("'%s' a son propre Makefile mais est ignore (%s) ; ajoute "
+                 "la lib a la main dans LDLIBS si besoin"
+                 % (rel_d, why or "nom invalide"))
+            continue
+        libs.append((rel_d, lib))
+        print("mkgen: bibliotheque detectee : %s (make -C %s)" % (lib, rel_d))
+    if is_lib and libs:
+        warn("NAME est une .a : les libs %s sont compilees mais pas "
+             "fusionnees dans %s" % (", ".join(l for _, l in libs), name))
+
+    # --- ecriture -----------------------------------------------------------
+    content = generate({
+        "name": name, "name_bonus": name_bonus, "obj_dir": obj_dir,
+        "srcs": mand_c, "srcs_bonus": srcs_bonus,
+        "hdrs": sorted(mand_h), "hdrs_bonus": sorted(bon_h),
+        "includes": includes, "libs": libs,
+    })
+
+    mk = os.path.join(root, "Makefile")
+    if os.path.isdir(mk):
+        die("'Makefile' est un dossier")
+    for other in ("GNUmakefile", "makefile"):
+        p = os.path.join(root, other)
+        if os.path.isfile(p) and not (os.path.exists(mk)
+                                      and os.path.samefile(p, mk)):
+            warn("'%s' existe : make le lira AVANT le Makefile genere, "
+                 "supprime-le" % other)
+    existed = os.path.exists(mk)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".mkgen_", dir=root)
+        with os.fdopen(fd, "w", newline="\n") as f:
+            f.write(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, mk)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError):
+            pass
+        die("impossible d'ecrire le Makefile (%s)" % e.strerror)
+
+    if obj_abs:
+        try:
+            os.makedirs(obj_abs, exist_ok=True)
+        except OSError as e:
+            die("impossible de creer '%s' (%s)" % (obj_dir, e.strerror))
+
+    print("mkgen: Makefile %s : %s" % ("remplace" if existed else "cree",
+                                        name))
+    print("  %d .c, %d .h%s%s" % (
+        len(mand_c), len(mand_h),
+        ", bonus : %d .c / %d .h" % (len(bon_c), len(bon_h)) if bon_c else "",
+        ", .o dans %s/" % obj_dir if obj_dir else ""))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
