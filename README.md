@@ -23,11 +23,20 @@
 
 ```bash
 git clone git@github.com:HorusExE69/MKGEN.git
-mkdir -p ~/bin && cp MKGEN/mkgen ~/bin/ && chmod +x ~/bin/mkgen
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+cd MKGEN && ./install.sh
+source ~/.zshrc   # ou ouvre un nouveau terminal
 ```
 
-Nécessite `python3`.
+Nécessite `python3` (>= 3.6). Pas besoin de `sudo`.
+
+| Commande | Effet |
+|---|---|
+| `./install.sh` | Copie `mkgen` dans `~/bin` et ajoute `~/bin` au `PATH` (`.zshrc` / `.bashrc`) |
+| `./install.sh --alias` | Crée un alias `mkgen` au lieu de modifier le `PATH` |
+| `./install.sh --dir DIR` | Installe dans `DIR` au lieu de `~/bin` |
+| `./install.sh --uninstall` | Supprime `mkgen` et les lignes ajoutées (avec `--dir DIR` si tu en as utilisé un) |
+
+Relancer `./install.sh` après un `git pull` met à jour mkgen sans dupliquer les lignes dans le `.zshrc`.
 
 ### Utilisation
 
@@ -92,11 +101,20 @@ Il avertit en cas de `main` absent ou multiple, d'include introuvable, ou de fic
 
 ```bash
 git clone git@github.com:HorusExE69/MKGEN.git
-mkdir -p ~/bin && cp MKGEN/mkgen ~/bin/ && chmod +x ~/bin/mkgen
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+cd MKGEN && ./install.sh
+source ~/.zshrc   # or open a new terminal
 ```
 
-Requires `python3`.
+Requires `python3` (>= 3.6). No `sudo` needed.
+
+| Command | Effect |
+|---|---|
+| `./install.sh` | Copies `mkgen` to `~/bin` and adds `~/bin` to `PATH` (`.zshrc` / `.bashrc`) |
+| `./install.sh --alias` | Creates a `mkgen` alias instead of changing `PATH` |
+| `./install.sh --dir DIR` | Installs into `DIR` instead of `~/bin` |
+| `./install.sh --uninstall` | Removes `mkgen` and the added lines (add `--dir DIR` if you used one) |
+
+Re-running `./install.sh` after a `git pull` updates mkgen without duplicating lines in your `.zshrc`.
 
 ### Usage
 
